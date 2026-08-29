@@ -53,6 +53,11 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar ht_em_local_dup{"NCCL_EP_HT_EM_LOCAL_DUP", ncclEpEnvType::flag};
     ncclEpEnvVar ht_em_nvlink_dup{"NCCL_EP_HT_EM_NVLINK_DUP", ncclEpEnvType::flag};
     ncclEpEnvVar disable_guard{"NCCL_EP_DISABLE_GUARD", ncclEpEnvType::flag};
+    // Unordered-fabric HT signaling (EFA/SRD): per-put weak signals + constant
+    // per-edge top-up instead of one strong tail signal that assumes same-QP
+    // put->signal ordering. Fixed at group creation; must not change between
+    // rounds of a live group.
+    ncclEpEnvVar unordered_fabric{"NCCL_EP_UNORDERED_FABRIC", ncclEpEnvType::flag};
     ncclEpEnvVar timeout_ms{"NCCL_EP_TIMEOUT_MS", ncclEpEnvType::ulong};
     ncclEpEnvVar comm_num_sms{"NCCL_EP_COMM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar prolog_epilog_sms{"NCCL_EP_PROLOG_EPILOG_SMS", ncclEpEnvType::ulong};

@@ -1299,6 +1299,7 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
 static ncclResult_t destroy_hybridep_internode(ncclEpGroup_t ep_group) {
     if (!ep_group->ht_buffers.internode_initialized) return ncclSuccess;
 
+
     // =========================================================================
     // Cleanup using public NCCL APIs
     // =========================================================================
@@ -3401,6 +3402,7 @@ ncclResult_t ncclEpDispatch(
         params.intra_node_write_completion_flags = group->ht_buffers.intra_node_write_completion_flags;
         params.dispatch_grid_barrier_counter = group->ht_buffers.dispatch_grid_barrier_counter;
         params.guard_enabled = !nccl_ep_env_flag_on(group->env.disable_guard);
+        params.unordered_fabric = nccl_ep_env_flag_on(group->env.unordered_fabric);
         // Pass device communicators and windows
         // Always pass a valid devComm (single-node too): the HT LSA sync-guard uses the NCCL LSA
         // barrier (needs comm.lsaBarrier). GIN/RDMA paths stay if-constexpr-gated (out single-node).

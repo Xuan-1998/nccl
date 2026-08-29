@@ -1057,6 +1057,7 @@ template <typename TOKEN_DATA_TYPE>
     kp.num_of_tokens_per_rank = params.num_tokens_per_rank;
     kp.local_dup_enabled = (params.local_dup_num_sms > 0);
     kp.guard_enabled = params.guard_enabled;
+    kp.unordered_fabric = params.unordered_fabric;
 
     // Pass device communicators and windows
     kp.dcomm = params.dcomm;

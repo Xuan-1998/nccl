@@ -355,6 +355,7 @@ struct DispatchParams {
     int local_dup_num_sms = 0;
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+    bool unordered_fabric = false; // EFA/SRD-safe HT signaling (NCCL_EP_UNORDERED_FABRIC)
 };
 
 // Call dispatch kernel with runtime template parameter resolution.
