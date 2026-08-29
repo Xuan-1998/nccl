@@ -23,6 +23,7 @@
 #include <nccl_device.h>
 #include "nccl_ep.h"
 #include "nccl_ep_env.h"
+#include "nccl_ep_gin_budget.h"
 #include "common.hpp"
 
 // HT (High Throughput) includes
@@ -1034,6 +1035,8 @@ static ncclResult_t destroy_hybridep_intranode(ncclEpGroup_t ep_group) {
 static constexpr int HYBRIDEP_GIN_MAX_CONTEXTS = 32;
 static constexpr int HYBRIDEP_GIN_CTXS_PER_COMM = 4;
 static constexpr int MAX_BARRIER_SESSIONS = 32;
+static_assert(MAX_BARRIER_SESSIONS == nccl_ep::gin_budget::kBarrierSignalSlack,
+              "signal-space slack for barriers is defined in nccl_ep_gin_budget.h");
 
 static ncclResult_t
 init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_config, cudaStream_t stream) {
@@ -1252,6 +1255,29 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     ep_group->gin_config.num_comms = 1;
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank;
 
+    // GDA endpoint-budget preflight. On the EFA GDA backend an over-budget
+    // request fails as an unexplained ENOMEM from fi_enable inside
+    // createContext; compute the cost here and say what to change instead.
+    // Rail count is not knowable portably at this layer, so warn for the
+    // worst case (all contexts on one NIC) and print the 2-rail number too.
+    {
+        namespace gb = nccl_ep::gin_budget;
+        const int n_signals = nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
+        if (!gb::fits_gda_budget(qps_per_rank, /*num_rails=*/1, n_signals) && ep_group->rank == 0) {
+            fprintf(stderr,
+                    "[HT GIN] budget note: %d contexts x %d signals costs %d counters/NIC on 1 rail "
+                    "(%d on 2 rails) against ~%d; on EFA GDA an over-budget request fails as "
+                    "fi_enable ENOMEM in createContext. Largest context count that fits at this "
+                    "signal count: %d (2 rails). Reduce NCCL_EP_QPS_PER_RANK or chunk count "
+                    "(NCCL_EP_TOKENS_PER_CHUNK).\n",
+                    qps_per_rank, n_signals,
+                    gb::counters_per_nic(qps_per_rank, 1, n_signals),
+                    gb::counters_per_nic(qps_per_rank, 2, n_signals),
+                    gb::kCountersPerNicBudget,
+                    gb::max_contexts_for(2, n_signals));
+        }
+    }
+
     // Compact signal namespace: [src_remote][chunk] per direction (see
     // dispatch_tail_signal_id in hybrid_ep.cuh). Signals are per-receiving-rank
     // resources and rail comms pair equal local ranks, so the old
@@ -1260,11 +1286,12 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     // kernels wait on. On EFA GDA every indexed signal costs a signal/counter
     // endpoint (2 HW counters) per GIN context against a ~256/NIC budget, so
     // this compaction is what makes multi-SM HT fit on GDA at all.
-    int edge_chunk_signals = (rdma_team_size - 1) * max_chunks_per_rank;
-    ep_group->gin_config.num_total_signals = 2 * edge_chunk_signals + MAX_BARRIER_SESSIONS;
+    ep_group->gin_config.num_total_signals =
+        nccl_ep::gin_budget::total_signals(rdma_team_size, max_chunks_per_rank);
     ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = 0;
-    ep_group->gin_config.signals_tail_base = edge_chunk_signals;
+    ep_group->gin_config.combine_signal_offset = nccl_ep::gin_budget::combine_signal_offset();
+    ep_group->gin_config.signals_tail_base =
+        nccl_ep::gin_budget::dispatch_tail_base(rdma_team_size, max_chunks_per_rank);
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
