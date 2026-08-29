@@ -293,6 +293,7 @@ struct combine_memory_region_info_t {
     size_t rdma_intra_node_red_prob_offset; // Offset of intra-node reduced prob buffer
     size_t combine_rdma_inter_node_group_prob_offset; // Offset of combine rdma prob buffer
     size_t guard_offset; // Offset of combine's RDMA sync-guard readiness flags
+    size_t combine_header_offset; // Unordered-fabric combine header slots (HT-3)
 };
 
 // ============================================================================
@@ -440,6 +441,8 @@ struct CombineParams {
     ncclDataType_t token_dtype = ncclBfloat16; // BF16/FP16/FP32 wire (NONE mode); ignored when use_fp8
 
     bool guard_enabled = false; // RDMA + LSA buffer guard on/off
+    bool unordered_fabric = false; // EFA/SRD-safe HT signaling (NCCL_EP_UNORDERED_FABRIC)
+    uint64_t* combine_sent_totals = nullptr; // sender cumulative signal totals (unordered mode)
 };
 
 // Call combine kernel with runtime template parameter resolution

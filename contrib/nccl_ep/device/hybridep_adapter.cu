@@ -1290,6 +1290,8 @@ ncclResult_t call_dispatch(
     kp.intra_node_write_completion_flags = params.combine_intra_node_write_completion_flags;
     kp.combine_grid_barrier_counter = params.combine_grid_barrier_counter;
     kp.guard_enabled = params.guard_enabled;
+    kp.unordered_fabric = params.unordered_fabric;
+    kp.combine_sent_totals = params.combine_sent_totals;
 
     // Runtime config
     kp.local_rank = params.local_rank;
@@ -1314,7 +1316,8 @@ ncclResult_t call_dispatch(
         .combine_rdma_inter_node_group_token_offset = params.mr_info.combine_rdma_inter_node_group_token_offset,
         .rdma_intra_node_red_prob_offset = params.mr_info.rdma_intra_node_red_prob_offset,
         .combine_rdma_inter_node_group_prob_offset = params.mr_info.combine_rdma_inter_node_group_prob_offset,
-        .guard_offset = params.mr_info.guard_offset
+        .guard_offset = params.mr_info.guard_offset,
+        .combine_header_offset = params.mr_info.combine_header_offset
     };
 
     return kp;

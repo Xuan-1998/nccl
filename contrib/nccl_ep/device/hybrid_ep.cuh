@@ -125,6 +125,10 @@ struct combine_memory_region_info_t {
     size_t rdma_intra_node_red_prob_offset; // Offset of intra-node reduced prob buffer
     size_t combine_rdma_inter_node_group_prob_offset; // Offset of combine rdma prob buffer
     size_t guard_offset; // RDMA sync-guard: offset of combine's internal-buffer readiness flags
+    // Unordered-fabric combine headers: [lsa_rank][src_node][chunk] uint64 slots.
+    // The sender putValue()s an iteration-tagged cumulative signal total here;
+    // the receiver polls it to learn how much to wait for. See the N2N warp.
+    size_t combine_header_offset;
 } __attribute__((__aligned__(8)));
 
 // ============================================================================
@@ -979,6 +983,12 @@ struct combine_kernel_param_base_t {
     // Cross-round WAR sync-guards: LSA (intra-node staging) uses the NCCL LSA barrier; RDMA
     // (inter-node staging) is hand-rolled. Only the enable flags are needed on the device now.
     bool guard_enabled; // cross-round WAR guard (LSA + RDMA share one enable)
+    // Unordered-fabric mode; see dispatch_kernel_param_base_t.
+    bool unordered_fabric;
+    // Sender-side cumulative signal totals per (lsa_rank, dst_node, chunk),
+    // device-resident so CUDA-graph replays self-sequence (same pattern as
+    // expected_rdma_flag_value). Only touched in unordered-fabric mode.
+    uint64_t* combine_sent_totals;
 #ifdef HYBRIDEP_ENABLE_WARP_TIMING
     combine_warp_timing_entry_t* warp_timing;
     combine_block_timing_entry_t* block_timing;
@@ -2794,7 +2804,10 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
     unsigned combine_signal_offset,
     const struct combine_memory_region_info_t* mr_info,
     SMEM_TYPE* smem_buffer_ptr,
-    const int experts_per_rank) {
+    const int experts_per_rank,
+    const bool unordered_fabric,
+    const uint64_t expected_flag_value,
+    uint64_t* combine_sent_totals) {
     // Token RDMA offsets/sizes below scale by size_u8 (4 B for FP32, 2 B for BF16/FP16);
     // prob is always float and is unaffected.
     // Load rdma_to_attn_map using LDG.128. Each token will need 1 bool from this map.
@@ -2853,6 +2866,26 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
         get_comm_ctx(global_channel, num_ctx_per_comm, comm_idx, ctx_idx);
         ncclGin net(dcomms[comm_idx], ctx_idx);
         ncclTeam rail = ncclTeamRail(dcomms[comm_idx]);
+        // Tail-signal id for this (chunk, edge), hoisted before the put loop: in
+        // unordered-fabric mode every data put carries a weak +1 on it, and the
+        // chunk-end header putValue (see the signal block below) carries the
+        // sender's cumulative total for the receiver to wait on.
+        constexpr int kMaxChunksPerRank = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
+        // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
+        const int combine_src_remote = node_rank < node_id ? node_rank : node_rank - 1;
+        const unsigned combine_tail_signal_id = signals_base + combine_signal_offset +
+                                                static_cast<unsigned>(combine_src_remote * kMaxChunksPerRank + chunk_id);
+        int n_weak_puts = 0;
+        const auto put_batched = [&](ncclWindow_t src_win, size_t src_off, size_t dst_off, size_t bytes) {
+            if (unordered_fabric) {
+                net.put(rail, node_id, nccl_internal_window, dst_off, src_win, src_off, bytes,
+                        ncclGin_WeakSignalAdd{combine_tail_signal_id, 1}, ncclGin_None{}, ncclCoopThread());
+                ++n_weak_puts;
+            } else {
+                net.put(rail, node_id, nccl_internal_window, dst_off, src_win, src_off, bytes,
+                        ncclGin_None{}, ncclGin_None{}, ncclCoopThread());
+            }
+        };
         int rdma_remote_node_id = node_id > node_rank ? node_id - 1 : node_id;
         int chunk_base_token_idx = node_id * rdma_to_attn_map_size_per_node + chunk_id * NUM_OF_TOKENS_PER_CHUNK;
         int token_range = 0;
@@ -2896,17 +2929,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
                         size_t token_dst_offset =
                             smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
                             (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        net.put(
-                            rail,
-                            node_id,
-                            nccl_internal_window,
-                            token_dst_offset,
-                            nccl_token_window,
-                            token_src_offset,
-                            batch_count * token_bytes,
-                            ncclGin_None{},
-                            ncclGin_None{},
-                            ncclCoopThread());
+                        put_batched(nccl_token_window, token_src_offset, token_dst_offset,
+                                    batch_count * token_bytes);
 
                         if constexpr (BACKWARD_COMBINE) {
                             size_t prob_src_offset =
@@ -2916,17 +2940,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
                             size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
                                                      (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                                                          (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-                            net.put(
-                                rail,
-                                node_id,
-                                nccl_internal_window,
-                                prob_dst_offset,
-                                nccl_prob_window,
-                                prob_src_offset,
-                                batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float),
-                                ncclGin_None{},
-                                ncclGin_None{},
-                                ncclCoopThread());
+                            put_batched(nccl_prob_window, prob_src_offset, prob_dst_offset,
+                                        batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float));
                         }
 
                         cumulative_sent += batch_count;
@@ -2948,19 +2963,41 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
             // Signal remote
             __syncwarp();
             if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-                // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
-                const int combine_src_remote = node_rank < node_id ? node_rank : node_rank - 1;
-                unsigned signal_id = signals_base + combine_signal_offset +
-                                     static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
-                net.signal(
-                    rail,
-                    node_id,
-                    ncclGin_SignalAdd{signal_id, 1},
-                    ncclCoopThread(),
-                    ncclGin_None{},
-                    cuda::thread_scope_thread,
-                    cuda::thread_scope_thread);
+                if (unordered_fabric) {
+                    // Cumulative-header protocol (HT-3). A top-up-to-constant signal is
+                    // pathological on EFA GDA, whose FI_REMOTE_WRITE counters advance by
+                    // exactly 1 per inbound write: the plugin expands Add-by-N into N
+                    // separate writes, so a top-up of (constant - n_puts) becomes a write
+                    // storm per (chunk, edge) per round. Instead, put the sender-side
+                    // cumulative signal total (this round's data puts + this header put)
+                    // into the edge's header slot, iteration-tagged, riding a weak +1.
+                    // The receiver polls the header for its round tag and then waits for
+                    // the absolute total (32-bit rolling compare). The header is absolute,
+                    // so the receiver keeps no state and residue chunks stay consistent.
+                    const unsigned hdr_idx = combine_tail_signal_id - signals_base - combine_signal_offset;
+                    const uint64_t new_total = combine_sent_totals[hdr_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
+                    combine_sent_totals[hdr_idx] = new_total;
+                    const uint64_t hdr = (expected_flag_value << 32) | (new_total & 0xffffffffull);
+                    net.putValue(
+                        rail,
+                        node_id,
+                        nccl_internal_window,
+                        smem_mr_info_ptr->combine_header_offset + static_cast<size_t>(hdr_idx) * sizeof(uint64_t),
+                        hdr,
+                        ncclGin_WeakSignalAdd{combine_tail_signal_id, 1},
+                        ncclCoopThread());
+                } else {
+                    // Strong tail signal: relies on same-QP put->signal ordering
+                    // (IB RC). Not valid on EFA/SRD; use NCCL_EP_UNORDERED_FABRIC.
+                    net.signal(
+                        rail,
+                        node_id,
+                        ncclGin_SignalAdd{combine_tail_signal_id, 1},
+                        ncclCoopThread(),
+                        ncclGin_None{},
+                        cuda::thread_scope_thread,
+                        cuda::thread_scope_thread);
+                }
             }
             __syncwarp();
 
@@ -3000,17 +3037,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
                         size_t token_dst_offset =
                             smem_mr_info_ptr->combine_rdma_inter_node_group_token_offset +
                             (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) * token_bytes;
-                        net.put(
-                            rail,
-                            node_id,
-                            nccl_internal_window,
-                            token_dst_offset,
-                            nccl_token_window,
-                            token_src_offset,
-                            batch_count * token_bytes,
-                            ncclGin_None{},
-                            ncclGin_None{},
-                            ncclCoopThread());
+                        put_batched(nccl_token_window, token_src_offset, token_dst_offset,
+                                    batch_count * token_bytes);
 
                         if constexpr (BACKWARD_COMBINE) {
                             size_t prob_src_offset =
@@ -3020,17 +3048,8 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
                             size_t prob_dst_offset = smem_mr_info_ptr->combine_rdma_inter_node_group_prob_offset +
                                                      (rank_in_remote * MAX_NUM_OF_TOKENS_PER_RANK + batch_start_token) *
                                                          (experts_per_rank * num_of_ranks_per_node) * sizeof(float);
-                            net.put(
-                                rail,
-                                node_id,
-                                nccl_internal_window,
-                                prob_dst_offset,
-                                nccl_prob_window,
-                                prob_src_offset,
-                                batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float),
-                                ncclGin_None{},
-                                ncclGin_None{},
-                                ncclCoopThread());
+                            put_batched(nccl_prob_window, prob_src_offset, prob_dst_offset,
+                                        batch_count * (experts_per_rank * num_of_ranks_per_node) * sizeof(float));
                         }
 
                         batch_count = 0;
@@ -3042,19 +3061,41 @@ __forceinline__ __device__ void inter_node_N2N_warp_group_device_function(
             // Signal remote
             __syncwarp();
             if (INTER_NODE_RDMA_GROUP::thread_rank() == 0) {
-                constexpr int MAX_CHUNKS_PER_RANK = MAX_NUM_OF_TOKENS_PER_RANK / NUM_OF_TOKENS_PER_CHUNK;
-                // Compact [src_remote][chunk] namespace; see dispatch_tail_signal_id.
-                const int combine_src_remote = node_rank < node_id ? node_rank : node_rank - 1;
-                unsigned signal_id = signals_base + combine_signal_offset +
-                                     static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + chunk_id);
-                net.signal(
-                    rail,
-                    node_id,
-                    ncclGin_SignalAdd{signal_id, 1},
-                    ncclCoopThread(),
-                    ncclGin_None{},
-                    cuda::thread_scope_thread,
-                    cuda::thread_scope_thread);
+                if (unordered_fabric) {
+                    // Cumulative-header protocol (HT-3). A top-up-to-constant signal is
+                    // pathological on EFA GDA, whose FI_REMOTE_WRITE counters advance by
+                    // exactly 1 per inbound write: the plugin expands Add-by-N into N
+                    // separate writes, so a top-up of (constant - n_puts) becomes a write
+                    // storm per (chunk, edge) per round. Instead, put the sender-side
+                    // cumulative signal total (this round's data puts + this header put)
+                    // into the edge's header slot, iteration-tagged, riding a weak +1.
+                    // The receiver polls the header for its round tag and then waits for
+                    // the absolute total (32-bit rolling compare). The header is absolute,
+                    // so the receiver keeps no state and residue chunks stay consistent.
+                    const unsigned hdr_idx = combine_tail_signal_id - signals_base - combine_signal_offset;
+                    const uint64_t new_total = combine_sent_totals[hdr_idx] + static_cast<uint64_t>(n_weak_puts) + 1;
+                    combine_sent_totals[hdr_idx] = new_total;
+                    const uint64_t hdr = (expected_flag_value << 32) | (new_total & 0xffffffffull);
+                    net.putValue(
+                        rail,
+                        node_id,
+                        nccl_internal_window,
+                        smem_mr_info_ptr->combine_header_offset + static_cast<size_t>(hdr_idx) * sizeof(uint64_t),
+                        hdr,
+                        ncclGin_WeakSignalAdd{combine_tail_signal_id, 1},
+                        ncclCoopThread());
+                } else {
+                    // Strong tail signal: relies on same-QP put->signal ordering
+                    // (IB RC). Not valid on EFA/SRD; use NCCL_EP_UNORDERED_FABRIC.
+                    net.signal(
+                        rail,
+                        node_id,
+                        ncclGin_SignalAdd{combine_tail_signal_id, 1},
+                        ncclCoopThread(),
+                        ncclGin_None{},
+                        cuda::thread_scope_thread,
+                        cuda::thread_scope_thread);
+                }
             }
             __syncwarp();
         }
@@ -3098,7 +3139,9 @@ __forceinline__ __device__ void combine_warps_G2S_inter(
     uint64_t* rdma_inter_node_group_flags,
     SMEM_TYPE* smem_buffer_ptr,
     const int experts_per_rank,
-    const bool combine_local_reduce_enabled) {
+    const bool combine_local_reduce_enabled,
+    const bool unordered_fabric,
+    uint64_t* combine_headers) {
     // The warps from inter-node G2S warp group will be divided into multiple independent pipeline.
     // Each pipeline can only have 1 warp, so INTER_NODE_G2S_GROUP::warp_size() == NUM_OF_DATA_PIPELINE_PER_BLOCK and warp has the same meaning as pipeline in inter-node G2S warp group.
     // Number of pipeline should match inter-node red warp group, so they can coupled into multiple independent data pipeline within a CUDA block.
@@ -3209,7 +3252,25 @@ __forceinline__ __device__ void combine_warps_G2S_inter(
                         node_id_for_signal < node_rank ? node_id_for_signal : node_id_for_signal - 1;
                     unsigned signal_id = signals_base + combine_signal_offset +
                                          static_cast<unsigned>(combine_src_remote * MAX_CHUNKS_PER_RANK + i);
-                    net.waitSignal(ncclCoopThread(), signal_id, expected_flag_value);
+                    if (unordered_fabric) {
+                        // Cumulative-header protocol (HT-3): poll the iteration-tagged
+                        // header the sender putValue()d for this (chunk, edge); it carries
+                        // the sender's cumulative signal total (absolute, so no receiver
+                        // state). Then wait for that total on the signal -- each weak +1
+                        // settled with its own put, so reaching the total proves every put
+                        // of this round arrived, with no ordering assumption. 32-bit
+                        // rolling compare handles the wrap of the packed total.
+                        const size_t hdr_idx =
+                            static_cast<size_t>(combine_src_remote) * MAX_CHUNKS_PER_RANK + i;
+                        const uint32_t tag = static_cast<uint32_t>(expected_flag_value);
+                        uint64_t hdr;
+                        do {
+                            hdr = nccl_ep::ld_relaxed_sys_global(&combine_headers[hdr_idx]);
+                        } while (static_cast<uint32_t>(hdr >> 32) != tag);
+                        net.waitSignal(ncclCoopThread(), signal_id, hdr & 0xffffffffull, /*bits=*/32);
+                    } else {
+                        net.waitSignal(ncclCoopThread(), signal_id, expected_flag_value);
+                    }
                 }
             }
             __syncwarp(0xffffffff);
@@ -4474,7 +4535,10 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
             param.rdma_inter_node_group_flags,
             smem_buffer_ptr,
             param.experts_per_rank,
-            param.combine_local_reduce_enabled);
+            param.combine_local_reduce_enabled,
+                param.unordered_fabric,
+                reinterpret_cast<uint64_t*>(
+                    static_cast<uint8_t*>(param.gin_base_ptr) + param.mr_info.combine_header_offset));
     } else if (
         threadIdx_x_int < INTRA_NODE_RED_GROUP::size() + INTER_NODE_RED_GROUP::size() + INTRA_NODE_G2S_GROUP::size() +
                               INTER_NODE_G2S_GROUP::size() + INTER_NODE_RDMA_GROUP::size()) {
@@ -4507,7 +4571,10 @@ __device__ __forceinline__ void combine_kernel_impl(const combine_kernel_param_t
                 param.combine_signal_offset,
                 &param.mr_info,
                 smem_buffer_ptr,
-                param.experts_per_rank);
+                param.experts_per_rank,
+                param.unordered_fabric,
+                *param.expected_rdma_flag_value,
+                param.combine_sent_totals);
         }
     } else {
         // Too many threads, should not goes here.
