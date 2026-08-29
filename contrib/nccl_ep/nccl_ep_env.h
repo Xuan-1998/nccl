@@ -58,6 +58,9 @@ struct ncclEpEnvConfig {
     ncclEpEnvVar prolog_epilog_sms{"NCCL_EP_PROLOG_EPILOG_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar preprocess_num_sms{"NCCL_EP_PREPROCESS_NUM_SMS", ncclEpEnvType::ulong};
     ncclEpEnvVar tokens_per_chunk{"NCCL_EP_TOKENS_PER_CHUNK", ncclEpEnvType::ulong};
+    // HT GIN contexts per rank; values below comm_sms*2 make channels share
+    // contexts (device-scope). For EFA GDA endpoint budgets.
+    ncclEpEnvVar qps_per_rank{"NCCL_EP_QPS_PER_RANK", ncclEpEnvType::ulong};
 };
 
 // True iff a flag variable was explicitly set to an "on" value (1/on/true).

@@ -1220,7 +1220,12 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     int qps_per_rank = ep_group->config.num_qp_per_rank;
     int min_required_ctx = ep_group->comm_num_sms * HYBRIDEP_DISPATCH_N2N_WARPS;
     if (qps_per_rank == 0) qps_per_rank = min_required_ctx;
-    if (qps_per_rank < min_required_ctx) {
+    if (ep_group->env.qps_per_rank.is_set && ep_group->env.qps_per_rank.value.ul > 0) {
+        // Fewer GIN contexts than channels: channels share contexts modularly and
+        // the kernels switch to device-scope resource sharing. Needed on EFA GDA,
+        // where per-context endpoint cost makes one context per channel unaffordable.
+        qps_per_rank = static_cast<int>(ep_group->env.qps_per_rank.value.ul);
+    } else if (qps_per_rank < min_required_ctx) {
         fprintf(stderr, "[HT GIN] Error: num_qp_per_rank(%d) must be >= %d for dedicated N2N warp contexts\n",
                 qps_per_rank, min_required_ctx);
         return ncclInvalidUsage;
@@ -1229,15 +1234,19 @@ init_hybridep_internode(ncclEpGroup_t ep_group, const ncclEpGroupConfig_t* in_co
     ep_group->gin_config.num_comms = 1;
     ep_group->gin_config.num_ctx_per_comm = qps_per_rank;
 
-    int dispatch_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int combine_signals = lsa_team_size * rdma_team_size * max_chunks_per_rank;
-    int streaming_tail_signals = rdma_team_size * rdma_team_size * lsa_team_size * max_chunks_per_rank;
-    int streaming_head_signals = rdma_team_size * rdma_team_size * lsa_team_size;
-    ep_group->gin_config.num_total_signals =
-        dispatch_signals + combine_signals + streaming_tail_signals + streaming_head_signals + MAX_BARRIER_SESSIONS;
+    // Compact signal namespace: [src_remote][chunk] per direction (see
+    // dispatch_tail_signal_id in hybrid_ep.cuh). Signals are per-receiving-rank
+    // resources and rail comms pair equal local ranks, so the old
+    // [src][dst][lrank][chunk] namespaces (plus two regions with no device
+    // consumer at all) requested lsa*rdma-fold more indexed signals than the
+    // kernels wait on. On EFA GDA every indexed signal costs a signal/counter
+    // endpoint (2 HW counters) per GIN context against a ~256/NIC budget, so
+    // this compaction is what makes multi-SM HT fit on GDA at all.
+    int edge_chunk_signals = (rdma_team_size - 1) * max_chunks_per_rank;
+    ep_group->gin_config.num_total_signals = 2 * edge_chunk_signals + MAX_BARRIER_SESSIONS;
     ep_group->gin_config.signals_base = 0;
-    ep_group->gin_config.combine_signal_offset = dispatch_signals;
-    ep_group->gin_config.signals_tail_base = dispatch_signals + combine_signals;
+    ep_group->gin_config.combine_signal_offset = 0;
+    ep_group->gin_config.signals_tail_base = edge_chunk_signals;
 
     // =========================================================================
     // Phase 3: comm setup (DevCommCreate + WindowRegister)
