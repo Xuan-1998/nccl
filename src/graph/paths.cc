@@ -976,9 +976,24 @@ static ncclResult_t ncclTopoGetNchannels(struct ncclComm* comm, int g /*local gp
       float netBw = 0.0;
       int netCount = 0;
       NCCLCHECK(ncclTopoGetLocalNetCountByBw(system, g, &netCount, &netBw));
-      // We use at least 1 channel per NIC, and more if needed to meet the bw requirement.
+      // === NCCLOFITICKET-2477 root cause demonstration ===
+      // NCCL <= 2.28.9 scaled channels-per-peer DOWN with communicator size:
+      //   start at 2, halve while nCh*nRanks > p2pnChannels*4, then take
+      //   max(nicCount, scaled). On a 64-rank p6-b300 communicator this gave
+      //   2 channels/peer.
+      // NCCL >= 2.29.2 replaced it with the NIC-bandwidth-driven value below
+      //   (max(netCount, netBw/NCCL_P2P_PER_CHANNEL_NET_BW=14GB/s)), which on
+      //   B300 (~50GB/s per-GPU net bw) selects 4 channels/peer regardless of
+      //   communicator size. 4 streams/peer x 8 peers sharing each NIC drops
+      //   large-message (>1GiB) alltoall busbw from ~106 to ~69 GB/s.
+      // The two lines below restore the 2.28.9 behavior (p2pnChannels is not
+      // computed yet at this call site in the 2.29+ init flow, so its later
+      // derivation min(nChannels, NCCL_MAX_P2P_NCHANNELS) is inlined here).
+      int p2pnChannelsEst = std::max(std::min(comm->nChannels > 0 ? comm->nChannels : MAXCHANNELS, (int)ncclParamMaxP2pNChannels()), (int)ncclParamMinP2pNChannels());
       nNetChannels = 2;
-      if (netCount > 0) nNetChannels = std::max(netCount, divUp((int)netBw, (int)ncclParamP2pPerChannelNetBw()));
+      while (nNetChannels*comm->nRanks > p2pnChannelsEst*4 && nNetChannels > 1) nNetChannels /= 2;
+      nNetChannels = std::max(netCount, nNetChannels);
+      (void)netBw;
     }
     *nChannels = nNetChannels;
   }
