@@ -1030,6 +1030,19 @@ ncclResult_t ncclTopoComputeP2pChannels(struct ncclComm* comm) {
            comm->p2pnChannelsPerPeer > 1) {
       comm->p2pnChannelsPerPeer /= 2;
     }
+    // Scale channels per peer down with communicator size, as in NCCL <= 2.28.
+    // The bandwidth-driven value from ncclTopoGetNchannels() is sized to let a
+    // few peers saturate the local NICs; in a large communicator every NIC
+    // already serves one connection per remote peer sharing it, so multiple
+    // channels per peer only multiply the number of concurrent proxy streams
+    // per NIC. Past the point where the streams' aggregate in-flight window
+    // exceeds what a NIC can pipeline, large-message p2p (e.g. alltoall)
+    // bandwidth degrades: on 8-node p6-b300 (8 NICs/host, 8 ranks/host,
+    // 4 channels/peer) alltoall busbw at 8 GiB drops from ~106 GB/s with
+    // 2 channels/peer to ~69 GB/s with 4.
+    while (comm->p2pnChannelsPerPeer * comm->nRanks > comm->p2pnChannels * 4 && comm->p2pnChannelsPerPeer > 1) {
+      comm->p2pnChannelsPerPeer /= 2;
+    }
   } else {
     comm->p2pnChannelsPerPeer = std::min(comm->p2pnChannels, comm->p2pnChannelsPerPeer);
   }
